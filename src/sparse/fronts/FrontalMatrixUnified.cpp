@@ -510,13 +510,14 @@ namespace strumpack {
             blas_handles[i].set_stream(streams[i]);
             solver_handles[i].set_stream(streams[i]);
         }
-        std::size_t max_small_fronts = 0, max_pinned = 0;
+        std::size_t max_small_fronts = 0, max_pinned = 0, max_F11_rows = 0;
         for (int l=lvls-1; l>=0; l--) {
             auto& L = ldata[l];
             max_small_fronts = std::max(max_small_fronts, L.N8+L.N16+L.N24+L.N32);
             for (auto& f : L.f) {
                 const std::size_t dsep = f->dim_sep();
                 const std::size_t dupd = f->dim_upd();
+                max_F11_rows = std::max(max_F11_rows, dsep);
                 std::size_t fs = dsep*(dsep + 2*dupd);
                 max_pinned = std::max(max_pinned, fs);
             }
@@ -530,6 +531,21 @@ namespace strumpack {
         gpu::HostMemory<char> hea_mem(peak_hea_mem);
         gpu::DeviceMemory<char> all_dmem(peak_dmem);
         char* old_work = nullptr;
+        long long toBeProceededNum = 0, droppedNum = 0, savedSpace = 0;
+        std::vector<integer_t> F11L_outerIndex;
+        F11L_outerIndex.reserve(max_F11_rows);
+        F11L_outerIndex.push_back(0);
+        std::vector<integer_t> F11L_innerIndex;
+        F11L_innerIndex.reserve(max_F11_rows*max_F11_rows*0.01);
+        std::vector<scalar_t> F11L_valueVec;
+        F11L_valueVec.reserve(max_F11_rows*max_F11_rows*0.01);
+        std::vector<integer_t> F11U_outerIndex;
+        F11U_outerIndex.reserve(max_F11_rows);
+        F11U_outerIndex.push_back(0);
+        std::vector<integer_t> F11U_innerIndex;
+        F11U_innerIndex.reserve(max_F11_rows*max_F11_rows*0.01);
+        std::vector<scalar_t> F11U_valueVec;
+        F11U_valueVec.reserve(max_F11_rows*max_F11_rows*0.01);
         for (int l=lvls-1; l>=0; l--) {
             // TaskTimer tl("");
             // tl.start();
@@ -715,6 +731,53 @@ namespace strumpack {
                                   (L.f[0]->pivot_mem_.data(), L.f[0]->piv_, L.piv_size));
 //                L.set_factor_pointers(L.f[0]->host_factors_.get());
                 L.set_factor_pointers(L.f[0]->host_factors_diagonal_.get(), L.f[0]->host_factors_off_diagonal_.get());
+                scalar_t runningTau=0.0001;
+
+                for (auto& f:L.f) {
+                    for (size_t col_index = 0; col_index < f->F11_.cols(); col_index++) {
+                        auto diag_element_down = f->F11_(col_index, col_index);
+                        for(size_t row_index = 0; row_index < col_index; row_index++) {
+                            auto diag_element_left = f->F11_(row_index, row_index);
+                            scalar_t F11_element = f->F11_(row_index, col_index);
+                            if (std::abs(F11_element) >
+                                std::abs(diag_element_left * diag_element_down * runningTau)) {
+                                F11U_valueVec.push_back(F11_element);
+                                F11U_innerIndex.push_back(row_index);
+                            }
+                        }
+                        F11U_valueVec.push_back(diag_element_down);
+                        F11U_innerIndex.push_back(col_index);
+                        F11L_valueVec.push_back(1);
+                        F11L_innerIndex.push_back(col_index);
+                        for(size_t row_index=col_index+1; row_index<f->F11_.rows(); row_index++){
+                            scalar_t F11_element = f->F11_(row_index, col_index);
+                            if (std::abs(F11_element) > std::abs(runningTau)) {
+                                F11L_valueVec.push_back(F11_element);
+                                F11L_innerIndex.push_back(row_index);
+                            }
+                        }
+                        F11L_outerIndex.push_back(F11L_innerIndex.size());
+                        F11U_outerIndex.push_back(F11U_innerIndex.size());
+                    }
+                    f->F11U_sparse_ = Eigen::Map<Eigen::SparseMatrix<scalar_t, Eigen::ColMajor, integer_t>> {static_cast<integer_t>(f->F11_.rows()),static_cast<integer_t>(f->F11_.cols()),static_cast<integer_t>(F11L_innerIndex.size()),F11U_outerIndex.data(),F11U_innerIndex.data(),F11U_valueVec.data()};
+                    f->F11L_sparse_ = Eigen::Map<Eigen::SparseMatrix<scalar_t, Eigen::ColMajor, integer_t>> {static_cast<integer_t>(f->F11_.rows()),static_cast<integer_t>(f->F11_.cols()),static_cast<integer_t>(F11U_innerIndex.size()),F11L_outerIndex.data(),F11L_innerIndex.data(),F11L_valueVec.data()};
+                    toBeProceededNum += f->F11_.rows()*f->F11_.cols();
+                    droppedNum += f->F11_.rows()*f->F11_.cols()-F11L_innerIndex.size()-F11U_innerIndex.size()+f->F11_.rows();
+                    savedSpace += static_cast<long>(f->F11_.rows()*f->F11_.cols())*sizeof(size_t)
+                            -(static_cast<long>(F11L_outerIndex.size())+static_cast<long>(F11L_innerIndex.size())
+                            +static_cast<long>(F11U_outerIndex.size())+static_cast<long>(F11U_innerIndex.size()))
+                            *sizeof(integer_t)
+                            -(static_cast<long>(F11L_valueVec.size())+static_cast<long>(F11U_valueVec.size()))*sizeof(size_t);
+                    F11L_outerIndex.clear();
+                    F11L_outerIndex.push_back(0);
+                    F11L_innerIndex.clear();
+                    F11L_valueVec.clear();
+                    F11U_outerIndex.clear();
+                    F11U_outerIndex.push_back(0);
+                    F11U_innerIndex.clear();
+                    F11U_valueVec.clear();
+                }
+
                 L.set_pivot_pointers(L.f[0]->pivot_mem_.data());
 
                 std::vector<int> getrf_infos(L.f.size());
@@ -742,6 +805,16 @@ namespace strumpack {
             //             << " GFLOP/s" << std::endl;
             // }
         }
+
+        std::cout << "# diagonal sparsification:" << std::endl;
+        std::cout<< "#   - drop elements = "
+                 << number_format_with_commas(droppedNum) << std::endl;
+        std::cout<< "#   - drop ratio = "
+                 << static_cast<double>(droppedNum)/static_cast<float>(toBeProceededNum) << std::endl;
+        std::cout<< "#   - saved memory = "
+                 << savedSpace/1024/1024<< " MB" << std::endl;
+
+
         const std::size_t dupd = dim_upd();
         if (dupd) { // get the contribution block from the device
             host_Schur_.reset(new scalar_t[dupd*dupd]);
@@ -758,7 +831,13 @@ namespace strumpack {
             (DenseM_t& b, DenseM_t& bupd, int etree_level, int task_depth) const {
         if (dim_sep()) {
             DenseMW_t bloc(dim_sep(), b.cols(), b, this->sep_begin_, 0);
-            F11_.solve_LU_in_place(bloc, piv_, task_depth);
+//            F11_.solve_LU_in_place(bloc, piv_, task_depth);
+//            F11L_sparse_.template triangularView<Eigen::Lower>().solveInPlace(Eigen::Map<Eigen::Matrix<scalar_t,Eigen::Dynamic,Eigen::Dynamic>>(bloc.data(), bloc.rows(),bloc.cols()));
+            Eigen::Map<Eigen::Matrix<scalar_t,Eigen::Dynamic,Eigen::Dynamic>> m{bloc.data(), bloc.rows(),bloc.cols()};
+//            Eigen::Matrix<scalar_t,Eigen::Dynamic,Eigen::Dynamic> pm{bloc.rows(),bloc.cols()};
+            laswp_omp_task(bloc.cols(), bloc.data(), bloc.ld(), 1, F11_.rows(), piv_, 1, task_depth);
+            F11L_sparse_.template triangularView<Eigen::Lower>().solveInPlace(m);
+            F11U_sparse_.template triangularView<Eigen::Upper>().solveInPlace(m);
             if (dim_upd()) {
                 if (b.cols() == 1)
                     gemv(Trans::N, scalar_t(-1.), F21_, bloc,
